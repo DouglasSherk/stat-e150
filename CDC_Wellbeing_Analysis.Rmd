@@ -1,0 +1,305 @@
+---
+title: "CDC Well-Being Analysis"
+output:
+  html_notebook:
+    toc: true
+    theme: united
+    highlight: tango
+    number_sections: true
+---
+
+# Data wrangling
+
+## Importing
+
+Import the data using the SAS format.
+
+```{r}
+library(Hmisc)
+import <- sasxport.get("LLCP2016.xpt")
+```
+
+List of all columns names in the data.
+
+```{r}
+names(import)
+```
+
+Select the useful columns from the data and remove any records with NA's.
+
+```{r}
+# These are the names of the fields we are taking from the CDC data.
+data = import[c('avedrnk2', 'alcday5', 'smokday2', 'x.ageg5yr', 'physhlth')]
+
+# Rename the columns to more useful and readable names (same order as above).
+colnames(data) <- c('average_drinks_per_day_drank',
+                    'days_in_last_30_had_a_drink',
+                    'smoking_frequency',
+                    'demographic_generation',
+                    'physically_healthy_days_in_last_30')
+```
+
+Let's take a look at some simple statistics for each field.
+
+NOTE: No preprocessing or cleaning has been performed on the data yet.
+
+```{r}
+summary(data)
+nrow(data)
+```
+
+## Cleaning and preprocessing
+
+### Removing useless and empty answers
+
+Ignore NAs in 'average_drinks_per_day_drank' as that variable encodes both missing and zero values as NA.
+
+```{r}
+data = data[!with(data, is.na(days_in_last_30_had_a_drink) |
+                        is.na(smoking_frequency) |
+                        is.na(demographic_generation) |
+                        is.na(physically_healthy_days_in_last_30)), ]
+```
+
+Remove people who reported any question with "Don't know" or "Refuse to answer."
+
+Each question encodes such answers differently:
+
+* Typically, one of 7, 77, or 777 are used to indicate a "don't know" answer.
+* 9, 99, and 9999 typically indicate "refuse" answers.
+
+```{r}
+data = subset(data, !(average_drinks_per_day_drank %in% c(77, 99)))
+data = subset(data, !(days_in_last_30_had_a_drink %in% c(777, 999)))
+data = subset(data, !(smoking_frequency %in% c(7, 9)))
+data = subset(data, demographic_generation != 14)
+data = subset(data, !(physically_healthy_days_in_last_30 %in% c(77, 99)))
+```
+
+#### Physical health
+
+An answer encoded as 88 indicates that the person has no unhealthy days. Recode such answers to 0.
+
+The answers to this question are encoded as number of unhealthy days. To transform the answers to be number of healthy days, subtract the answers from 30.
+
+```{r}
+data$physically_healthy_days_in_last_30[data$physically_healthy_days_in_last_30 == 88] <- 0
+data$physically_healthy_days_in_last_30 = 30 - data$physically_healthy_days_in_last_30
+```
+
+#### Demographic generation
+
+Remove people who are not in any of the targeted age ranges. Groups 1-10 cover ages 18-69. We're not analyzing the health of anyone above 69 years old.
+
+```{r}
+data = subset(data, demographic_generation %in% c(1:10))
+```
+
+### Recoding variables into groups
+
+#### Demographic generation
+
+Recode age groups into demographics by joining smaller ones into larger ones:
+
+* **Groups 1-3** (ages 18-24, 25-29, 30-34): *Millenials*.
+* **Groups 4-6** (ages 35-39, 40-44, 45-49): *Generation X*.
+* **Groups 7-10** (ages 50-54, 54-59, 60-64, 65-69): *Baby Boomers*.
+
+```{r}
+data$demographic_generation = cut(data$demographic_generation,
+                                  breaks=c(-Inf, 3, 6, Inf),
+                                  labels=c('Millenials', 'Generation X', 'Baby Boomers'))
+```
+
+#### Drinking frequency
+
+Let the objective of this section be to compute a respondent's average number of drinks consumed per week.
+
+This section is quite complicated. The data we're given does not provide a straightforward to compute the average number of drinks someone consumes per week. Fortunately, this measurement can be computed using several other variables with which we are provided:
+
+* **Average number of drinks consumed per day that a person drinks**. This variable is encoded as blank/NA for people who have not drank at all in the last month.
+* **Number of days in the last 30 that a person drank at all**. This variable is encoded strangely; respondents could either answer how many days in the last week that they drank, or the amount of days in the last month that they drank.
+
+The intuition for what we're going to do is format each of these variables such that we can apply the equation `drinking_frequency = average_drinks_per_day_drank * days_in_last_30_had_a_drink`.
+
+---
+
+"Number of days in the last 30 that a person drank at all" is encoded somewhat strangely as follows:
+
+1. **If the respondent answered with the number of days in the last week that they drank**, then the field takes on a value from 101-107, where subtracting 100 gives the true number of days in which the person drank.
+2. **If the respondent answered with the number of days in the last month that they drank**, then the field takes on a value from 201-230, where subtracting 200 gives the true number of days in which the person drank.
+3. **If the respondent did not drink at all in the last month**, then the field takes on a value of 888.
+
+To make it easier to understand each step, let's transform this variable into the number of times in the last month that the person drank. We can do this by:
+
+* Subtracting 100 from case 1 and then multiplying by 4 weeks in a month to extrapolate how much the respondent drank in the last month.
+* Subtracting 200 from case 2.
+* Recoding case 3 as 0.
+
+Later on, you'll see that we care about the number of times in the last week that the person drank; however, we recoded the variable in the last step to days in the last 30 that the person drank because the name of the variable is "days_in_last_30_had_a_drink", so it's easier to follow the logic when naming conventions are always consistent.
+
+```{r}
+days = data$days_in_last_30_had_a_drink
+
+data$days_in_last_30_had_a_drink[days == 888] <- 0
+data$days_in_last_30_had_a_drink[days >= 100 & days < 200] <- (data$days_in_last_30_had_a_drink[days >= 100 & days < 200] - 100) * 4
+data$days_in_last_30_had_a_drink[days >= 200 & days < 300] <- data$days_in_last_30_had_a_drink[days >= 200 & days < 300] - 200
+```
+
+Now that we have the number of days in the last 30 in which the respondent drank at all, we can apply the formula above. Note that our ultimate goal is to get the number of days in the last week in which the person drank, so we must divide the frequency by 4.
+
+```{r}
+data$average_drinks_per_day_drank[is.na(data$average_drinks_per_day_drank)] <- 0
+data$drinking_frequency = (data$days_in_last_30_had_a_drink * data$average_drinks_per_day_drank) %/% 4
+```
+
+Now, let's partition the respondents into three groups:
+
+1. People who don't drink at all.
+2. People who drink, but would not be classified as alcoholics (1-8 drinks/week).
+3. People who would be classified as alcoholics (9+ drinks/week).
+
+NOTE: The official diagnoses are different for men and women, so we use the mean of the two terms to classify both genders. In the future, we may want to separate the classifications out for each gender.
+
+```{r}
+data$drinking_frequency = cut(data$drinking_frequency, breaks=c(-Inf, 0, 8, Inf), labels=c('None', 'Some', 'Alcoholism'))
+```
+
+For the final step, let's remove the intermediate columns from the original dataset; they only add noise at this point.
+
+```{r}
+data = within(data, rm(days_in_last_30_had_a_drink, average_drinks_per_day_drank))
+```
+
+#### Smoking frequency
+
+Smoking frequency is encoded as follows:
+
+1. Every day.
+2. Some days.
+3. Not at all.
+
+This ordering is not very useful for analysis, so let's re-order it as follows:
+
+0. Not at all.
+1. Some days.
+2. Every day.
+
+```{r}
+data$smoking_frequency[data$smoking_frequency == 3] <- 0
+# Swap 1 and 2 because they're in a confusing order.
+data$smoking_frequency[data$smoking_frequency == 1] <- 9999
+data$smoking_frequency[data$smoking_frequency == 2] <- 1
+data$smoking_frequency[data$smoking_frequency == 9999] <- 2
+```
+
+Next, let's rename the partitions from numbers, which are difficult to read, into the factors "None", "Some Days", and "Every Day".
+
+```{r}
+data$smoking_frequency = cut(data$smoking_frequency, breaks=c(-Inf, 0, 1, Inf), labels=c('None', 'Some Days', 'Every Day'))
+```
+
+# Data exploration
+
+## High-level overview
+
+Now that we have completed all the data wrangling and preprocessing, let's explore the data for trends which we can spot visually.
+
+```{r}
+summary(data)
+data
+hist(data)
+```
+
+## Group means
+
+A quick check of the healthy days group means for the categories within each predictor will tell us if there's any merit to further analysis at all.
+
+```{r}
+aggregate(data$physically_healthy_days_in_last_30, list(data$drinking_frequency), mean)
+aggregate(data$physically_healthy_days_in_last_30, list(data$smoking_frequency), mean)
+aggregate(data$physically_healthy_days_in_last_30, list(data$demographic_generation), mean)
+aggregate(data$physically_healthy_days_in_last_30, list(data$drinking_frequency, data$smoking_frequency, data$demographic_generation), mean)
+```
+
+From the results above, it's impossible to say whether there is an effect in each group or not; however, with our large sample size, and the substantial differences between group means, we can speculate that further analysis is promising.
+
+# Hierarchical regression
+
+```{r}
+fit = lm(physically_healthy_days_in_last_30 ~ drinking_frequency + smoking_frequency + demographic_generation, data)
+summary(fit)
+```
+
+```{r}
+library(car)
+outlierTest(fit)
+qqPlot(fit, main='QQ Plot')
+leveragePlots(fit)
+```
+
+```{r}
+avPlots(fit)
+cutoff <- 4/((nrow(data) - length(fit$coefficients) - 2))
+plot(fit, which=4, cook.levels=cutoff)
+
+influencePlot(fit, id.method='identify', main='Influence Plot', sub='Circle size is proportional to Cook\'s Distance')
+```
+
+
+```{r}
+library(MASS)
+sresid <- stdres(fit) # Use `studres` for Studentized residuals instead?
+hist(sresid, freq=FALSE, main='Distribution of Standardized Residuals')
+xfit <- seq(min(sresid), max(sresid), length=40)
+yfit <- dnorm(xfit)
+lines(xfit, yfit)
+```
+
+```{r}
+ncvTest(fit)
+spreadLevelPlot(fit)
+```
+
+```{r}
+vif(fit)
+sqrt(vif(fit)) > 2 # Problem?
+```
+
+```{r}
+crPlots(fit)
+```
+
+```{r}
+durbinWatsonTest(fit)
+```
+
+```{r}
+library(gvlma)
+gvmodel <- gvlma(fit)
+summary(gvmodel)
+```
+
+
+```{r}
+M = aov(physically_healthy_days_in_last_30 ~ drinking_frequency + smoking_frequency + demographic_generation, data)
+summary(M)
+```
+
+```{r}
+anova(
+  lm(physically_healthy_days_in_last_30 ~ demographic_generation, data),
+  lm(physically_healthy_days_in_last_30 ~ drinking_frequency + demographic_generation, data),
+  lm(physically_healthy_days_in_last_30 ~ drinking_frequency + smoking_frequency + demographic_generation, data)
+)
+```
+
+
+```{r}
+
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file).
